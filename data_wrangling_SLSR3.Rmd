@@ -1,0 +1,492 @@
+---
+title: "f"
+output: html_document
+date: "2023-11-10"
+editor_options: 
+  chunk_output_type: console
+---
+
+---
+title: "data_wrangling_SYRFoutcomeswork"
+output: html_document
+date: "2023-11-10"
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(dplyr)
+library(stringr)
+library(tibble)
+library(tidyverse)
+library(tidyr)
+library(purrr)
+setwd("/Users/francescatinsdeall/Library/Mobile Documents/com~apple~CloudDocs/Desktop/PhD /LSRs/Meta-Analysis/data_wrangling.SYRFoutcomes")
+```
+
+# Import SyRF outcome data
+```{r}
+LSR3_SyRFOutcomes_091123 <- read_csv("LSR3 - TAAR agonists for psychosis_SyRF091123.csv")
+```
+
+# Filter for reconciled studies (and rename columns for consistency with shiny outcomes/remove SYRF columnns)
+
+```{r}
+LSR3_reconciled <- LSR3_SyRFOutcomes_091123 %>% 
+  filter(`Is this a reconciliation?` == TRUE) %>%  #for PTSD `is this a reconciliation?`
+  rename(ModelID = `DiseaseModelId(s)`, 
+         ExperimentID = ExperimentId, 
+         InterventionLabel = `TreatmentLabel(s)`,
+         InterventionID = `TreatmentId(s)`,
+         OutcomeResult = OutcomeAverage,
+         `Dose of pharmacological induction (dose)` = `Dose of pharmacological induction...61`,
+         `Dose of pharmacological induction (units)` = `Dose of pharmacological induction...62`) %>% 
+  select(-(Title:InvestigatorName)) 
+
+```
+
+# Match split studies [Get pairs from bibliographic download on SyRF]
+PAIR 1: 
+fb8ed201-f663-48db-aae1-8ee88b355abd - main
+dd9dddac-739b-412f-9fac-6f36e0a21494 - appendix
+
+PAIR 2: 
+4f31dcd6-e041-4882-acc8-dbf3ccfd2368 - main
+283c541f-6f14-462b-9f3a-800b69a3f44c - appendix
+
+## 1. Overwrite appendix ARRIVE/ROB with main ARRIVE/ROB (issue with pair 2 not matching)
+```{r}
+# Function to overwrite column values in appendix study with values from main study (but relies on them having unique studyID's, so don't use this to overwrite the studyID)
+overwrite_appendix_data <- function(x, main_study_id, appendix_study_id, column_names) {
+  main_values <- x %>%
+    filter(StudyId == main_study_id) %>%
+    select(all_of(column_names)) %>%
+    slice(1) %>% 
+    unlist(use.names = FALSE)
+
+  x %>%
+    mutate(across(all_of(column_names), ~ifelse(StudyId == appendix_study_id, main_values[match(cur_column(), column_names)], .)))
+}
+```
+
+```{r}
+# Overwrite the appendix ARRIVE/ROB with main ARRIVE/ROB values for both pairs
+## Find position of the start and end of ARRIVE ROB columns to store column names between the start and end index
+col_names <- names(LSR3_reconciled)
+start_index <- match("Method of allocation of experimental units to groups?", col_names)
+end_index <- match("Is any role of the funder in the design/analysis/reporting of study described?", col_names)
+ARRIVEROB_columns <- col_names[start_index:end_index] 
+
+## Pair 1 and 2
+LSR3_reconciled <- LSR3_reconciled %>% 
+  overwrite_appendix_data("fb8ed201-f663-48db-aae1-8ee88b355abd", "dd9dddac-739b-412f-9fac-6f36e0a21494", ARRIVEROB_columns) %>% 
+  overwrite_appendix_data("4f31dcd6-e041-4882-acc8-dbf3ccfd2368", "283c541f-6f14-462b-9f3a-800b69a3f44c", ARRIVEROB_columns)
+```
+
+
+## 2. Replace StudyId of appendix with the main paper StudyId 
+```{r}
+# Overwrite studyID string for appendix studies with the studyID string of the 'main' study
+LSR3_reconciled <- LSR3_reconciled %>% 
+  mutate(StudyId = ifelse(StudyId == 'dd9dddac-739b-412f-9fac-6f36e0a21494', 'fb8ed201-f663-48db-aae1-8ee88b355abd', StudyId)) %>% 
+  mutate(StudyId = ifelse(StudyId == '283c541f-6f14-462b-9f3a-800b69a3f44c', '4f31dcd6-e041-4882-acc8-dbf3ccfd2368', StudyId))
+```
+
+
+## 3. Further step to remove observations from an accidental dual-reconciliation: choose the most recent reconciliation (unlikely to be necessary)
+
+```{r}
+# Choose the most recent reconciliation 
+recent_reconciledID <- LSR3_reconciled %>%
+  arrange(desc(DateTimeDataEntered)) %>%
+  group_by(StudyId) %>%
+  slice(1) %>%
+  ungroup()
+
+# Filter all records that have a StudyIdStr and AnnotatorIdStr that is in the reconciled_study_annotator_pairs
+reconciled_records_unique <- LSR3_reconciled %>%
+  semi_join(recent_reconciledID, by = "StudyId")
+
+write_csv(reconciled_records_unique, 'reconciled_records09.csv')
+```
+
+# Rearrange rows to be grouped by studies and then experiment within studies. Reorder columns for readability
+
+```{r}
+reconciled_records <- reconciled_records_unique %>%
+  arrange(StudyId, ExperimentID, CohortId, OutcomeId, InterventionID) %>% 
+  rename(`Dose of positive control treatment?` = `Dose of control treatment?`) %>% 
+  relocate(ExperimentLabel, .after = ExperimentID) %>% 
+  relocate(CohortLabel, .after = CohortId) %>% 
+  relocate(OutcomeLabel, .after = OutcomeId) %>% 
+  relocate(c(OutcomeLabel, OutcomeId), .after = ExperimentLabel) %>% 
+  relocate(c(InterventionLabel), .after = InterventionID)
+```
+
+# Remove columns that do not vary their values within individual studies (-> reconciled_studyconstants df). Join later
+Now two dataframes, one which contains information that is the same for every observation within a study (reconciled_studyconstants), and one which contains information that differs across every observation (reconciled_studyvaried)
+
+```{r}
+reconciled_constants <- reconciled_records %>%
+  group_by(StudyId) %>%
+  summarise(across(everything(), ~n_distinct(.) == 1)) %>%
+  select_if(~all(.)) %>%
+  names() #contains information that is important to each experiment e.g. Age of animal at intervention, Type of numerical data (all are means). But for ease, still remove because will left join them back onto smaller df later.
+
+reconciled_varied <- reconciled_records %>% 
+  select(-any_of(reconciled_constants))
+
+write.csv(reconciled_varied, 'reconciled_varied091123.csv')
+```
+
+# Split any column with a ; value 
+
+```{r}
+split_columns <- function(x) {
+  # Identify columns containing ';' in any of their values
+  cols_to_split <- sapply(x, function(column) any(grepl(";", column)))
+  
+  # For each column that needs splitting
+  for(col in names(x)[cols_to_split]) {
+    # Create two new columns with appropriate names
+    x <- x %>%
+      separate(col, into = c(paste0(col, "[1]"), paste0(col, "[2]")),
+               sep = ";", fill = "right", remove = TRUE) %>% 
+    # Replace empty strings with NA in the new columns
+      mutate(across(c(paste0(col, "[1]"), paste0(col, "[2]")), ~ replace(., . == "", NA)))
+  }
+  return(x)
+}
+
+reconciled_varied <- split_columns(reconciled_varied)
+```
+
+# Label types of cohorts
+Aim = Make each experiment one comparison (sham vs. control vs. intervention)
+## Differentiate between positive and negative controls and TAAR1KO's
+
+```{r}
+reconciled_varied <- reconciled_varied %>%
+  mutate(
+    Treatment1Type = case_when(
+      str_detect(`InterventionLabel[1]`, regex("veh|con", ignore_case = TRUE)) ~ "Negative control",
+      str_detect(`InterventionLabel[1]`, "TAAR1 KO") ~ "TAAR1KO",
+      str_detect(`InterventionLabel[1]`, regex("cloza|risp|ari|olan|olz", ignore_case = TRUE)) & !str_detect(`InterventionLabel[1]`, regex("ro", ignore_case = TRUE)) ~ "Positive control",
+      is.na(`InterventionLabel[1]`) ~ NA_character_,
+      TRUE ~ "Intervention"
+    ),
+    Treatment2Type = case_when(
+      str_detect(`InterventionLabel[2]`, regex("veh|con", ignore_case = TRUE)) ~ "Negative control",
+      str_detect(`InterventionLabel[2]`, "TAAR1 KO") ~ "TAAR1KO",
+      str_detect(`InterventionLabel[2]`, regex("cloza|risp|ari|olan|olz", ignore_case = TRUE)) & !str_detect(`InterventionLabel[2]`, regex("ro", ignore_case = TRUE)) ~ "Positive control",
+      is.na(`InterventionLabel[2]`) ~ NA_character_,
+      TRUE ~ "Intervention"
+    )
+  )
+
+```
+
+## Make CohortType column
+Combination interventions are interventions where currently licenced antipsychotic is an intervention
+```{r}
+reconciled_varied <- reconciled_varied %>%
+  mutate(CohortType = case_when(
+     IsDiseaseModelControl == TRUE & 
+    ((Treatment1Type == "TAAR1KO" & Treatment2Type == "Negative control") |
+       (Treatment2Type == "TAAR1KO" & Treatment1Type == "Negative control")) ~ "Sham for TAAR1KO comb.",
+    
+     IsDiseaseModelControl == FALSE & 
+    ((Treatment1Type == "TAAR1KO" & Treatment2Type == "Negative control") |
+       (Treatment2Type == "TAAR1KO" & Treatment1Type == "Negative control")) ~ "Negative control for TAAR1KO comb.",
+    
+     IsDiseaseModelControl == FALSE & 
+    ((Treatment1Type == "TAAR1KO" & Treatment2Type == "Positive control") |
+       (Treatment2Type == "TAAR1KO" & Treatment1Type == "Positive control")) ~ "Positive control for TAAR1KO comb.",
+    
+     IsDiseaseModelControl == FALSE & 
+    ((Treatment1Type == "TAAR1KO" & Treatment2Type == "Intervention") |
+       (Treatment2Type == "TAAR1KO" & Treatment1Type == "Intervention")) ~ "Intervention and TAAR1KO comb.",
+    
+    (IsDiseaseModelControl == TRUE | is.na(IsDiseaseModelControl)) & 
+    (Treatment1Type %in% c("TAAR1KO", "Negative control", NA) & 
+     Treatment2Type %in% c("TAAR1KO", "Negative control", NA)) ~ "Sham for simple intervention",
+    
+    (IsDiseaseModelControl == TRUE | is.na(IsDiseaseModelControl)) & 
+      (Treatment1Type == "Positive control" | Treatment2Type == "Positive control") ~ "Sham for combination intervention",
+    
+    (IsDiseaseModelControl == TRUE | is.na(IsDiseaseModelControl)) & 
+    (Treatment1Type == "Positive control" & (Treatment2Type != "Intervention" | is.na(Treatment2Type)) | 
+     (Treatment2Type == "Positive control" & (Treatment1Type != "Intervention" | is.na(Treatment1Type)))) ~ "Positive control treated sham",
+    
+    (IsDiseaseModelControl == TRUE | is.na(IsDiseaseModelControl)) & 
+    (Treatment1Type == "Intervention" | Treatment2Type == "Intervention") ~ "Intervention treated sham",
+    
+    IsDiseaseModelControl == FALSE & 
+    (Treatment1Type == "Positive control" & (Treatment2Type != "Intervention" | is.na(Treatment2Type)) | 
+     (Treatment2Type == "Positive control" & (Treatment1Type != "Intervention" | is.na(Treatment1Type)))) ~ "Positive control",
+    
+    IsDiseaseModelControl == FALSE & 
+    (Treatment1Type != "Intervention" | is.na(Treatment1Type)) & 
+    (Treatment2Type != "Intervention" | is.na(Treatment2Type)) ~ "Negative control for simple intervention",
+    
+    IsDiseaseModelControl == FALSE & 
+    ((Treatment1Type == "Intervention" & Treatment2Type == "Positive control") | 
+      (Treatment2Type == "Intervention" & Treatment1Type == "Positive control")) ~ "Combination intervention",
+    
+    IsDiseaseModelControl == FALSE & 
+    (Treatment1Type == "Intervention" & is.na(Treatment2Type)) | 
+      (Treatment2Type == "Intervention" & is.na(Treatment1Type)) ~ "Simple intervention"
+  )) %>% 
+  relocate(CohortType, .after = `InterventionID[2]`) %>% 
+  relocate(c(Treatment1Type, Treatment2Type), .after = `InterventionLabel[2]`) %>% 
+  relocate(IsDiseaseModelControl, .after = ModelID)
+```
+
+## Label how positive controls are being used
+If for an observation with the value "Positive control" in the CohortType column, there is an observation with the CohortType "Combination intervention" with the same combination of values in the StudyId, ExperimentID, OutcomeId, TimeInMinute variables, then the value in the CohortType column needs changed to "Control for combination intervention". Similarly, if for an observation with the value "Positive control treated sham" in the CohortType column, there is an observation with the CohortType "Combination intervention" with the same combination of values in the StudyId, ExperimentID, OutcomeId, TimeInMinute variables, then the value in the CohortType column needs changed to "Sham for combination intervention"
+
+
+```{r}
+# Write function
+positive_control_cohort_type <- function(x) {
+  # Identify the groups that have 'Combination intervention'
+  combination_groups <- x %>%
+    filter(CohortType == "Combination intervention") %>%
+    select(StudyId, ExperimentID, OutcomeId, TimeInMinute) %>%
+    distinct() %>%
+    mutate(GroupID = interaction(StudyId, ExperimentID, OutcomeId, TimeInMinute))
+
+  # Update the CohortType for matching groups in the original dataframe
+  x <- x %>%
+    mutate(GroupID = interaction(StudyId, ExperimentID, OutcomeId, TimeInMinute)) %>%
+    mutate(CohortType = ifelse(CohortType == "Positive control" & 
+                               (GroupID %in% combination_groups$GroupID),
+                               "Control for combination intervention", 
+                               CohortType)) %>%
+    mutate(CohortType = ifelse(CohortType == "Positive control treated sham" & 
+                               (GroupID %in% combination_groups$GroupID),
+                               "Sham for combination intervention", 
+                               CohortType))
+  return(x)
+}
+
+reconciled_varied <- positive_control_cohort_type(reconciled_varied)
+# write_csv(reconciled_varied, 'reconciled_variedMM.csv')
+```
+
+## Remove positive control cohorts that are not used as sham or control for combination experiments (they are not relevant to our comparisons)
+Only interested in a positive control if, within the same experiment, there is a combination intervention observation 
+
+```{r}
+reconciled_varied_relevant <- reconciled_varied %>% 
+  filter(CohortType != "Positive control")
+```
+
+## Identify experiments that are just 'Simple' comparison, those which are 'Combination' comparisons and those which have 'TAAR1KO' involved
+
+```{r}
+reconciled_varied_relevant <- reconciled_varied_relevant %>% 
+  mutate(ExperimentType = case_when(CohortType == str_detect("combination") ~ "Antipsychotic combination", 
+                                    CohortType == str_detect("TAAR1") ~ "TAAR1KO combination", 
+                                    CohortType == )
+
+
+
+
+
+RoleOfCohort
+```
+
+
+
+
+
+
+
+
+
+## Add placeholder sham rows if not present 
+
+```{r}
+# Make function
+add_missing_sham <- function(x) {
+  # Check whether each OutcomeId within each experiment has a sham associated or not
+  sham_presence <- x %>% 
+    group_by(GroupID) %>% 
+    summarise(HasSham = any(str_detect(CohortType, regex("sham", ignore_case = TRUE))), .groups = 'drop')
+  
+  missing_sham <- sham_presence %>%
+    filter(!HasSham) %>% 
+    select(-HasSham)
+
+  # Join with the original data to get the required columns for these missing shams
+  missing_sham_data <- missing_sham %>%
+    left_join(x %>% 
+              distinct(StudyId, ExperimentID, ExperimentLabel, OutcomeLabel, OutcomeId, .keep_all = TRUE), 
+              by = c("ExperimentID", "OutcomeId")) %>%
+    mutate(CohortType = "Sham") %>% 
+    mutate(across(.cols = !c("StudyId", "ExperimentID", "ExperimentLabel", "OutcomeLabel", "OutcomeId", "CohortType"),
+                  .fns = ~ NA)) 
+  
+  y <- bind_rows(x, missing_sham_data) 
+  
+  y <- y %>% 
+    arrange(StudyId, ExperimentID, OutcomeId)
+
+  # Combine with the original data
+  return(y)
+
+}
+
+
+  sham_presence <- reconciled_varied_relevant %>% 
+    group_by(GroupID) %>% 
+    summarise(HasSham = any(str_detect(CohortType, regex("sham", ignore_case = TRUE))), .groups = 'drop')
+  
+  missing_sham <- sham_presence %>%
+    filter(!HasSham) %>% 
+    select(-HasSham)
+
+  # Join with the original data to get the required columns for these missing shams
+  missing_sham_data <- missing_sham %>%
+    left_join(reconciled_varied_relevant) 
+  
+  
+  
+  combination_groups <- reconciled_varied_relevant %>%
+    filter(CohortType == "Combination intervention") %>% 
+    select(GroupID) %>% 
+    distinct()
+  
+  TAAR1_groups <- reconciled_varied_relevant %>%
+    filter(CohortType == "Intervention and TAAR1KO comb.") %>% 
+    select(GroupID) %>% 
+    distinct()
+  
+  simple_groups <- reconciled_varied_relevant %>%
+    filter(CohortType == "Simple intervention") %>% 
+    select(GroupID) %>% 
+    distinct()
+    
+unique_to_combination <- setdiff(combination_groups$GroupID, union(TAAR1_groups$GroupID, simple_groups$GroupID))
+
+
+unique_to_TAAR1 <- setdiff(TAAR1_groups$GroupID, union(combination_groups$GroupID, simple_groups$GroupID))
+unique_to_simple <- setdiff(simple_groups$GroupID, union(combination_groups$GroupID, TAAR1_groups$GroupID))
+  
+  
+  %>%
+    mutate(CohortType = "Sham") %>% 
+    mutate(across(.cols = !c("StudyId", "ExperimentID", "ExperimentLabel", "OutcomeLabel", "OutcomeId", "CohortType"),
+                  .fns = ~ NA)) 
+  
+  y <- bind_rows(x, missing_sham_data) 
+  
+  y <- y %>% 
+    arrange(StudyId, ExperimentID, OutcomeId)
+
+  # Combine with the original data
+  return(y)
+
+}
+
+
+
+reconciled_varied_relevant <- add_missing_sham(reconciled_varied_relevant)
+```
+
+## Make a ComparisonID column which assigns a unique ComparisonID to each comparison. This will be used as the identifier for pivots
+Within an OutcomeId within an ExperimentID, each observation with the value 'Intervention' in the Cohort Type column should be assigned a unique ComparisonID
+
+now have a unique identifier for each intervention for each OutcomeId within each ExperimentID. I need to assign the identifiers that have been generated for the interventions (within each OutcomeId and ExperimentID) to the observations with 'Sham' and 'Control' values in the CohortType column that match the OutcomeId and ExperimentID for those interventions. This is made more complicated by the fact that sometimes there will be more than one intervention for each OutcomeId and ExperimentID pair, but only one 'Control' observation, and so the control will match multiple comparisonID's. I need all of those comparisonIDs to be assigned to the control 
+
+Simple intervention                     
+ 2 Negative control for simple intervention
+ 3 Sham                                    
+ 4 Sham for simple intervention            
+ 5 Intervention treated sham               
+ 6 Control for combination intervention    
+ 7 Combination intervention                
+ 8 Intervention and TAAR1KO comb.          
+ 9 Sham for TAAR1KO comb.                  
+10 Negative control for TAAR1KO comb.  
+
+```{r}
+library(uuid)
+
+reconciled_comparison <- reconciled_varied %>%
+  group_by(ExperimentID, OutcomeId, `InterventionID[1]`, `InterventionLabel[2]`, TimeInMinute, CohortId) %>%
+  mutate(ComparisonID = ifelse(CohortType == "Simple intervention" | CohortType == "Combination intervention" | CohortType == "Intervention and TAAR1KO comb.", UUIDgenerate(), NA)) %>%
+  ungroup()
+
+# Separate interventions and sham/control groups 
+interventions <- reconciled_comparison %>% 
+  filter(CohortType %in% c("Simple intervention", "Combination intervention", "Intervention and TAAR1KO comb."))
+
+controls_shams <- reconciled_comparison %>% 
+  filter(CohortType %in% c("Sham", "Negative control", "Positive control", "Sham for TAAR1KO comb.", "Negative control for TAAR1KO comb.", "Positive control for TAAR1KO comb."))
+
+# Concatenate unique identifiers for each OutcomeId, ExperimentID and TimeInMinute pair
+concatenated_ids <- interventions %>%
+  group_by(StudyId, ExperimentID, OutcomeId, TimeInMinute) %>%
+  summarise(ConcatenatedComparisonID = paste(ComparisonID, collapse = ";"), .groups = 'drop')
+
+# 
+controls_sham_comparison <- controls_shams %>% 
+  left_join()
+
+
+
+
+# Concatenate unique identifiers for each OutcomeId and ExperimentID pair
+concatenated_ids <- interventions %>%
+  group_by(StudyId, ExperimentID, OutcomeId, TimeInMinute) %>%
+  summarise(ConcatenatedComparisonID = paste(ComparisonID, collapse = ";"), .groups = 'drop')
+
+# Join this information back to the original dataframe
+reconciled_comparison <- reconciled_comparison %>%
+  left_join(concatenated_ids, by = c("ExperimentID", "OutcomeId", "TimeInMinute"))
+
+# Assign these concatenated identifiers to 'Control' and 'Sham' observations
+data_with_concatenated_ids <- data_with_concatenated_ids %>%
+  mutate(ComparisonID = ifelse(CohortType %in% c("Sham", "Control"), ConcatenatedComparisonID, ComparisonID)) %>%
+  select(-ConcatenatedComparisonID)  # Remove the temporary concatenated ID column
+
+
+
+```
+
+
+
+
+```{r}
+
+
+reconciled_varied_relevantw <- reconciled_varied_relevant %>% 
+  group_by(ExperimentID, OutcomeId, TimeInMinute) %>%
+  pivot_wider(
+    id_cols = c(StudyId, ExperimentLabel, ExperimentID, OutcomeId, OutcomeLabel, TimeInMinute), # Adding TimeInMinute
+    names_from = CohortType,  # Use CohortType values as suffixes
+    names_glue = "{.value}.{CohortType}",  # Create new column names
+    values_from = setdiff(names(reconciled_varied_relevant), c("StudyId", "ExperimentLabel", "ExperimentID", "OutcomeId", "OutcomeLabel", "CohortType", "TimeInMinute")) # Exclude grouping variables
+  )
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
